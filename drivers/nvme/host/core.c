@@ -89,6 +89,11 @@ static dev_t nvme_chr_devt;
 static struct class *nvme_class;
 static struct class *nvme_subsys_class;
 
+struct nvme_id_list {
+	struct list_head	entry;
+	unsigned		ns_id;
+};
+
 static void nvme_put_subsystem(struct nvme_subsystem *subsys);
 static void nvme_remove_invalid_namespaces(struct nvme_ctrl *ctrl,
 					   unsigned nsid);
@@ -130,6 +135,12 @@ static void nvme_queue_scan(struct nvme_ctrl *ctrl)
 	 */
 	if (ctrl->state == NVME_CTRL_LIVE && ctrl->tagset)
 		queue_work(nvme_wq, &ctrl->scan_work);
+}
+
+static void nvme_zns_scan(struct nvme_ctrl *ctrl)
+{
+	if (ctrl->state == NVME_CTRL_LIVE && ctrl->tagset)
+		queue_work(nvme_wq, &ctrl->scan_zns_work);
 }
 
 /*
@@ -1436,7 +1447,8 @@ EXPORT_SYMBOL_GPL(nvme_set_queue_count);
 
 #define NVME_AEN_SUPPORTED \
 	(NVME_AEN_CFG_NS_ATTR | NVME_AEN_CFG_FW_ACT | \
-	 NVME_AEN_CFG_ANA_CHANGE | NVME_AEN_CFG_DISC_CHANGE)
+	 NVME_AEN_CFG_ANA_CHANGE | NVME_AEN_ZNS_DESC_CHANGE | \
+	 NVME_AEN_CFG_DISC_CHANGE)
 
 static void nvme_enable_aen(struct nvme_ctrl *ctrl)
 {
@@ -4081,9 +4093,9 @@ static void nvme_scan_ns_sequential(struct nvme_ctrl *ctrl)
 	nvme_remove_invalid_namespaces(ctrl, nn);
 }
 
-static void nvme_clear_changed_ns_log(struct nvme_ctrl *ctrl)
+static void nvme_clear_changed_log(struct nvme_ctrl *ctrl, u32 ns_id, u8 log_id,
+				u8 csi, size_t log_size)
 {
-	size_t log_size = NVME_MAX_CHANGED_NAMESPACES * sizeof(__le32);
 	__le32 *log;
 	int error;
 
@@ -4093,15 +4105,14 @@ static void nvme_clear_changed_ns_log(struct nvme_ctrl *ctrl)
 
 	/*
 	 * We need to read the log to clear the AEN, but we don't want to rely
-	 * on it for the changed namespace information as userspace could have
-	 * raced with us in reading the log page, which could cause us to miss
-	 * updates.
+	 * on it for the changed namespace/zns desc list information as
+	 * userspace could have raced with us in reading the log page,
+	 * which could cause us to miss updates.
 	 */
-	error = nvme_get_log(ctrl, NVME_NSID_ALL, NVME_LOG_CHANGED_NS, 0,
-			NVME_CSI_NVM, log, log_size, 0);
+	error = nvme_get_log(ctrl, ns_id, log_id, 0, csi, log, log_size, 0);
 	if (error)
 		dev_warn(ctrl->device,
-			"reading changed ns log failed: %d\n", error);
+			"reading changed log failed: %d\n", error);
 
 	kfree(log);
 }
@@ -4116,8 +4127,11 @@ static void nvme_scan_work(struct work_struct *work)
 		return;
 
 	if (test_and_clear_bit(NVME_AER_NOTICE_NS_CHANGED, &ctrl->events)) {
+		size_t log_size = NVME_MAX_CHANGED_NAMESPACES * sizeof(__le32);
+
 		dev_info(ctrl->device, "rescanning namespaces.\n");
-		nvme_clear_changed_ns_log(ctrl);
+		nvme_clear_changed_log(ctrl, NVME_NSID_ALL, NVME_LOG_CHANGED_NS,
+					NVME_CSI_NVM, log_size);
 	}
 
 	mutex_lock(&ctrl->scan_lock);
@@ -4128,6 +4142,31 @@ static void nvme_scan_work(struct work_struct *work)
 	down_write(&ctrl->namespaces_rwsem);
 	list_sort(NULL, &ctrl->namespaces, ns_cmp);
 	up_write(&ctrl->namespaces_rwsem);
+}
+
+static void nvme_scan_zns_work(struct work_struct *work)
+{
+	struct nvme_ctrl *ctrl =
+		container_of(work, struct nvme_ctrl, scan_zns_work);
+	LIST_HEAD(work_list);
+	size_t log_size = (NVME_ZONE_ID_LIST + 1) * sizeof(__le64);
+	struct nvme_ns *ns;
+	struct nvme_id_list *curr, *next;
+
+	spin_lock(&ctrl->zns_list_lock);
+	list_replace_init(&ctrl->zns_ns_id_head, &work_list);
+	spin_unlock(&ctrl->zns_list_lock);
+
+	list_for_each_entry_safe(curr, next, &work_list, entry) {
+		ns = nvme_find_get_ns(ctrl, curr->ns_id);
+		if (ns && blk_queue_is_zoned(ns->queue)) {
+			nvme_clear_changed_log(ctrl, ns->head->ns_id,
+						NVME_LOG_CHANGED_ZONE_LIST,
+						NVME_CSI_ZNS, log_size);
+			nvme_revalidate_zones(ns);
+		}
+		kfree(curr);
+	}
 }
 
 /*
@@ -4283,9 +4322,11 @@ static void nvme_fw_act_work(struct work_struct *work)
 	nvme_get_fw_slot_info(ctrl);
 }
 
-static void nvme_handle_aen_notice(struct nvme_ctrl *ctrl, u32 result)
+static void nvme_handle_aen_notice(struct nvme_ctrl *ctrl, u64 result)
 {
-	u32 aer_notice_type = (result & 0xff00) >> 8;
+	u64 aer_notice_type = (result & 0xff00) >> 8;
+	unsigned long flags;
+	struct nvme_id_list *ns_id_list;
 
 	trace_nvme_async_event(ctrl, aer_notice_type);
 
@@ -4293,6 +4334,22 @@ static void nvme_handle_aen_notice(struct nvme_ctrl *ctrl, u32 result)
 	case NVME_AER_NOTICE_NS_CHANGED:
 		set_bit(NVME_AER_NOTICE_NS_CHANGED, &ctrl->events);
 		nvme_queue_scan(ctrl);
+		break;
+	case NVME_ZONE_DESC_CHANGED:
+		ns_id_list = kzalloc(sizeof(*ns_id_list), GFP_ATOMIC);
+		if (!ns_id_list) {
+			dev_warn(ctrl->device,
+				"failed to allocate memory for AEN=0x%llx\n",
+				aer_notice_type);
+			return;
+		}
+		ns_id_list->ns_id = result >> 32;
+
+		spin_lock_irqsave(&ctrl->zns_list_lock, flags);
+		list_add_tail(&ns_id_list->entry, &ctrl->zns_ns_id_head);
+		spin_unlock_irqrestore(&ctrl->zns_list_lock, flags);
+
+		nvme_zns_scan(ctrl);
 		break;
 	case NVME_AER_NOTICE_FW_ACT_STARTING:
 		/*
@@ -4314,15 +4371,15 @@ static void nvme_handle_aen_notice(struct nvme_ctrl *ctrl, u32 result)
 		ctrl->aen_result = result;
 		break;
 	default:
-		dev_warn(ctrl->device, "async event result %08x\n", result);
+		dev_warn(ctrl->device, "async event result %llx\n", result);
 	}
 }
 
 void nvme_complete_async_event(struct nvme_ctrl *ctrl, __le16 status,
 		volatile union nvme_result *res)
 {
-	u32 result = le32_to_cpu(res->u32);
-	u32 aer_type = result & 0x07;
+	u64 result = le64_to_cpu(res->u64);
+	u64 aer_type = result & 0x07;
 
 	if (le16_to_cpu(status) >> 1 != NVME_SC_SUCCESS)
 		return;
@@ -4417,6 +4474,7 @@ int nvme_init_ctrl(struct nvme_ctrl *ctrl, struct device *dev,
 	spin_lock_init(&ctrl->lock);
 	mutex_init(&ctrl->scan_lock);
 	INIT_LIST_HEAD(&ctrl->namespaces);
+	INIT_LIST_HEAD(&ctrl->zns_ns_id_head);
 	xa_init(&ctrl->cels);
 	init_rwsem(&ctrl->namespaces_rwsem);
 	ctrl->dev = dev;
@@ -4424,10 +4482,12 @@ int nvme_init_ctrl(struct nvme_ctrl *ctrl, struct device *dev,
 	ctrl->quirks = quirks;
 	ctrl->numa_node = NUMA_NO_NODE;
 	INIT_WORK(&ctrl->scan_work, nvme_scan_work);
+	INIT_WORK(&ctrl->scan_zns_work, nvme_scan_zns_work);
 	INIT_WORK(&ctrl->async_event_work, nvme_async_event_work);
 	INIT_WORK(&ctrl->fw_act_work, nvme_fw_act_work);
 	INIT_WORK(&ctrl->delete_work, nvme_delete_ctrl_work);
 	init_waitqueue_head(&ctrl->state_wq);
+	spin_lock_init(&ctrl->zns_list_lock);
 
 	INIT_DELAYED_WORK(&ctrl->ka_work, nvme_keep_alive_work);
 	memset(&ctrl->ka_cmd, 0, sizeof(ctrl->ka_cmd));

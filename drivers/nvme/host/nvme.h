@@ -237,6 +237,7 @@ struct nvme_ctrl {
 	enum nvme_ctrl_state state;
 	bool identified;
 	spinlock_t lock;
+	spinlock_t zns_list_lock;
 	struct mutex scan_lock;
 	const struct nvme_ctrl_ops *ops;
 	struct request_queue *admin_q;
@@ -302,11 +303,14 @@ struct nvme_ctrl {
 	struct nvme_effects_log *effects;
 	struct xarray cels;
 	struct work_struct scan_work;
+	struct work_struct scan_zns_work;
 	struct work_struct async_event_work;
 	struct delayed_work ka_work;
 	struct nvme_command ka_cmd;
 	struct work_struct fw_act_work;
 	unsigned long events;
+
+	struct list_head zns_ns_id_head;
 
 #ifdef CONFIG_NVME_MULTIPATH
 	/* asymmetric namespace access: */
